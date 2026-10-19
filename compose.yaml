@@ -1,0 +1,31 @@
+services:
+  app:
+    build: .
+    ports: ["4000:4000"]
+    env_file: backend/.env
+    environment:
+      MONGODB_URI: mongodb://mongo:27017/global_patterns
+      # Local HTTP only. Set production and use an HTTPS proxy for a public deployment.
+      NODE_ENV: development
+    depends_on:
+      mongo:
+        condition: service_healthy
+    volumes: [uploads:/app/backend/storage]
+    mem_limit: 1536m
+    cpus: 1.5
+    restart: unless-stopped
+  mongo:
+    image: mongo:7
+    command: ["mongod", "--wiredTigerCacheSizeGB", "0.25"]
+    volumes: [mongo_data:/data/db]
+    mem_limit: 768m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+volumes:
+  mongo_data:
+  uploads:

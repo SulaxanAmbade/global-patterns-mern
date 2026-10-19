@@ -1,0 +1,32 @@
+{
+  "name": "global-patterns-backend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node --max-old-space-size=192 src/server.js",
+    "test": "node --test test/*.test.js",
+    "migrate": "node scripts/import-jsonl.js",
+    "storage-report": "node scripts/storage-report.js",
+    "storage-optimize": "node scripts/storage-optimize.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "csv-parse": "^7.0.3",
+    "dotenv": "^16.6.1",
+    "exceljs": "^4.4.0",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.1.0",
+    "helmet": "^8.1.0",
+    "mongodb": "^6.17.0",
+    "multer": "^2.0.2",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  },
+  "overrides": {
+    "exceljs": {
+      "uuid": "^11.1.1"
+    }
+  }
+}
