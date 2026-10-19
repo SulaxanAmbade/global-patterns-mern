@@ -358,7 +358,7 @@ async function install(db, local, revision) {
       },
     });
 
-    if (batch.length === 1000) {
+    if (batch.length === 5000) {
       await writeBatch('patterns', batch);
       batch = [];
     }
@@ -461,7 +461,7 @@ async function install(db, local, revision) {
         },
       });
 
-      if (batch.length === 1000) {
+      if (batch.length === 5000) {
         await writeBatch('pairs', batch);
         batch = [];
       }
