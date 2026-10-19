@@ -1,6 +1,9 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { createHash, randomUUID } from 'node:crypto';
+import {
+  createHash,
+  randomUUID,
+} from 'node:crypto';
 import { openLocal } from './localStore.js';
 import { storage } from '../config.js';
 import { expandedPairs } from './pairStore.js';
@@ -17,7 +20,6 @@ const digest = (value) =>
     .update(JSON.stringify(value))
     .digest('hex');
 
-// SRV resolution can change host order between connections.
 const databaseFingerprint = (db) => {
   const options = db.client.options;
 
@@ -31,29 +33,37 @@ const databaseFingerprint = (db) => {
 };
 
 function matchesDatabase(db, fingerprint) {
-  if (fingerprint === databaseFingerprint(db)) {
-    return true;
-  }
-
-  // Support manifests written by the earlier fingerprint code.
-  const hosts = (db.client.options.hosts || []).map(String);
-  const srv = db.client.options.srvHost || '';
-
   if (
-    fingerprint === digest([db.databaseName, srv, hosts])
+    fingerprint === databaseFingerprint(db)
   ) {
     return true;
   }
 
-  if (hosts.length > 6) {
-    return false;
+  const hosts = (
+    db.client.options.hosts || []
+  ).map(String);
+
+  const srv =
+    db.client.options.srvHost || '';
+
+  if (
+    fingerprint ===
+    digest([db.databaseName, srv, hosts])
+  ) {
+    return true;
   }
+
+  if (hosts.length > 6) return false;
 
   function visit(prefix, remaining) {
     if (!remaining.length) {
       return (
         fingerprint ===
-        digest([db.databaseName, srv, prefix])
+        digest([
+          db.databaseName,
+          srv,
+          prefix,
+        ])
       );
     }
 
@@ -81,7 +91,10 @@ const patternId = (row) =>
 export async function replacementState() {
   try {
     return JSON.parse(
-      await fs.readFile(maintenancePath, 'utf8'),
+      await fs.readFile(
+        maintenancePath,
+        'utf8',
+      ),
     );
   } catch (error) {
     if (error.code === 'ENOENT') {
@@ -104,12 +117,17 @@ async function manifest(state) {
   );
 }
 
-export async function makeBackup(db, requestedId) {
+export async function makeBackup(
+  db,
+  requestedId,
+) {
   const metadata = await db
     .collection('metadata')
     .findOne({ _id: 'active' });
 
-  const id = requestedId || 'backup-' + randomUUID();
+  const id =
+    requestedId || 'backup-' + randomUUID();
+
   const local = openLocal(id);
 
   let patternCount = 0;
@@ -121,7 +139,9 @@ export async function makeBackup(db, requestedId) {
 
       for await (const row of db
         .collection('patterns')
-        .find({ revision: metadata.revision })
+        .find({
+          revision: metadata.revision,
+        })
         .batchSize(500)) {
         batch.push(row);
         patternCount++;
@@ -143,7 +163,10 @@ export async function makeBackup(db, requestedId) {
 
       batch = [];
 
-      for await (const row of expandedPairs(db, metadata)) {
+      for await (const row of expandedPairs(
+        db,
+        metadata,
+      )) {
         batch.push(row);
         keywordCount++;
 
@@ -175,14 +198,17 @@ export async function makeBackup(db, requestedId) {
       patternCount !== savedPatterns ||
       keywordCount !== savedKeywords
     ) {
-      throw Error('Backup count verification failed');
+      throw Error(
+        'Backup count verification failed',
+      );
     }
   } finally {
     local.close();
   }
 
   return {
-    databaseFingerprint: databaseFingerprint(db),
+    databaseFingerprint:
+      databaseFingerprint(db),
     backupId: id,
     backupMetadata: metadata,
     backupPatterns: patternCount,
@@ -192,8 +218,13 @@ export async function makeBackup(db, requestedId) {
 
 async function clearActiveCollections(db) {
   // Keep sessions, jobs and metadata.
-  for (const name of ['patterns', 'pairs']) {
-    await db.collection(name).deleteMany({});
+  for (const name of [
+    'patterns',
+    'pairs',
+  ]) {
+    await db
+      .collection(name)
+      .deleteMany({});
 
     await db
       .collection(name)
@@ -205,8 +236,11 @@ async function clearActiveCollections(db) {
       });
   }
 
-  // Remove obsolete processing collections from earlier versions.
-  for (const name of ['scratch', 'jobRows']) {
+  // Remove obsolete processing collections.
+  for (const name of [
+    'scratch',
+    'jobRows',
+  ]) {
     await db
       .collection(name)
       .drop()
@@ -219,29 +253,39 @@ async function clearActiveCollections(db) {
 }
 
 export async function compactIndexes(db) {
-  await db.collection('patterns').createIndex({
-    revision: 1,
-    length: -1,
-    _id: 1,
-  });
+  await db
+    .collection('patterns')
+    .createIndex({
+      revision: 1,
+      length: -1,
+      _id: 1,
+    });
 
-  await db.collection('patterns').createIndex({
-    aliases: 1,
-    language_code: 1,
-  });
+  await db
+    .collection('patterns')
+    .createIndex({
+      aliases: 1,
+      language_code: 1,
+    });
 
-  await db.collection('pairs').createIndex({
-    patternId: 1,
-    keywordKey: 1,
-  });
+  await db
+    .collection('pairs')
+    .createIndex({
+      patternId: 1,
+      keywordKey: 1,
+    });
 }
 
 async function install(db, local, revision) {
-  console.log('[Dataset] Clearing incomplete records...');
+  console.log(
+    '[Dataset] Clearing incomplete records...',
+  );
 
   await clearActiveCollections(db);
 
-  console.log('[Dataset] Reading the local dataset...');
+  console.log(
+    '[Dataset] Reading the local dataset...',
+  );
 
   const processed = {
     patterns: 0,
@@ -249,17 +293,17 @@ async function install(db, local, revision) {
   };
 
   async function writeBatch(name, rows) {
-    if (!rows.length) {
-      return;
-    }
+    if (!rows.length) return;
 
     console.log(
       `[Dataset] Sending ${rows.length} ${name} records...`,
     );
 
-    await db.collection(name).bulkWrite(rows, {
-      ordered: false,
-    });
+    await db
+      .collection(name)
+      .bulkWrite(rows, {
+        ordered: false,
+      });
 
     processed[name] += rows.length;
 
@@ -270,7 +314,8 @@ async function install(db, local, revision) {
 
   let batch = [];
 
-  const sourcePatterns = local.collection('patterns');
+  const sourcePatterns =
+    local.collection('patterns');
 
   for await (const row of sourcePatterns.find()) {
     const pattern = {
@@ -303,8 +348,12 @@ async function install(db, local, revision) {
 
     batch.push({
       updateOne: {
-        filter: { _id: pattern._id },
-        update: { $set: pattern },
+        filter: {
+          _id: pattern._id,
+        },
+        update: {
+          $set: pattern,
+        },
         upsert: true,
       },
     });
@@ -321,20 +370,78 @@ async function install(db, local, revision) {
 
   batch = [];
 
-  for await (const pair of local.collection('pairs').find()) {
+  // Reuse source-pattern IDs across a pattern's keywords.
+  // Bound both cache entries and total cached IDs.
+  const sourceCache = new Map();
+  let cachedIds = 0;
+
+  async function sourceIds(pair) {
+    const cacheKey = JSON.stringify([
+      pair.source_pattern,
+      pair.language,
+      pair.source_admin_name !== undefined,
+      pair.source_admin_name,
+    ]);
+
+    if (sourceCache.has(cacheKey)) {
+      const ids = sourceCache.get(cacheKey);
+
+      sourceCache.delete(cacheKey);
+      sourceCache.set(cacheKey, ids);
+
+      return ids;
+    }
+
     const filter = {
       url_pattern: pair.source_pattern,
       language_code: pair.language,
     };
 
-    if (pair.source_admin_name !== undefined) {
-      filter.admin_name = pair.source_admin_name;
+    if (
+      pair.source_admin_name !== undefined
+    ) {
+      filter.admin_name =
+        pair.source_admin_name;
     }
 
-    for await (const pattern of sourcePatterns.find(filter)) {
-      const pid = patternId(pattern);
-      const keywordKey = key(pair.keyword);
+    const ids = [];
 
+    for await (const row of sourcePatterns.find(
+      filter,
+    )) {
+      ids.push(patternId(row));
+    }
+
+    if (ids.length <= 1000) {
+      while (
+        sourceCache.size &&
+        (
+          sourceCache.size >= 256 ||
+          cachedIds + ids.length > 5000
+        )
+      ) {
+        const oldest =
+          sourceCache.keys().next().value;
+
+        cachedIds -=
+          sourceCache.get(oldest).length;
+
+        sourceCache.delete(oldest);
+      }
+
+      sourceCache.set(cacheKey, ids);
+      cachedIds += ids.length;
+    }
+
+    return ids;
+  }
+
+  for await (const pair of local
+    .collection('pairs')
+    .find()) {
+    const keywordKey = key(pair.keyword);
+
+    for (const pid of await sourceIds(pair)) {
       const row = {
         _id: digest([pid, keywordKey]),
         patternId: pid,
@@ -344,8 +451,12 @@ async function install(db, local, revision) {
 
       batch.push({
         updateOne: {
-          filter: { _id: row._id },
-          update: { $set: row },
+          filter: {
+            _id: row._id,
+          },
+          update: {
+            $set: row,
+          },
           upsert: true,
         },
       });
@@ -361,7 +472,9 @@ async function install(db, local, revision) {
     await writeBatch('pairs', batch);
   }
 
-  console.log('[Dataset] Rebuilding indexes...');
+  console.log(
+    '[Dataset] Rebuilding indexes...',
+  );
 
   await compactIndexes(db);
 
@@ -376,36 +489,47 @@ async function install(db, local, revision) {
 }
 
 async function restore(db, state) {
-  if (!matchesDatabase(db, state.databaseFingerprint)) {
+  if (
+    !matchesDatabase(
+      db,
+      state.databaseFingerprint,
+    )
+  ) {
     throw Error(
       'Recovery backup belongs to a different database. Restore the previous MONGODB_URI before recovering.',
     );
   }
 
-  const local = openLocal(state.backupId, {
-    existing: true,
-  });
+  const local = openLocal(
+    state.backupId,
+    { existing: true },
+  );
 
   try {
     await install(
       db,
       local,
-      state.backupMetadata?.revision || 'empty',
+      state.backupMetadata?.revision ||
+        'empty',
     );
 
     if (state.backupMetadata) {
-      await db.collection('metadata').replaceOne(
-        { _id: 'active' },
-        {
-          ...state.backupMetadata,
-          schemaVersion: 2,
-        },
-        { upsert: true },
-      );
+      await db
+        .collection('metadata')
+        .replaceOne(
+          { _id: 'active' },
+          {
+            ...state.backupMetadata,
+            schemaVersion: 2,
+          },
+          { upsert: true },
+        );
     } else {
       await db
         .collection('metadata')
-        .deleteOne({ _id: 'active' });
+        .deleteOne({
+          _id: 'active',
+        });
     }
 
     await fs.unlink(maintenancePath);
@@ -417,17 +541,18 @@ async function restore(db, state) {
 export async function recoverReplacement(db) {
   const state = await replacementState();
 
-  if (!state) {
-    return;
-  }
+  if (!state) return;
 
   const active = await db
     .collection('metadata')
     .findOne({ _id: 'active' });
 
-  if (!matchesDatabase(db, state.databaseFingerprint)) {
-    // Older manifests may contain a different resolved host list.
-    // Require a matching existing dataset revision before migration.
+  if (
+    !matchesDatabase(
+      db,
+      state.databaseFingerprint,
+    )
+  ) {
     const expected = [
       state.backupMetadata?.revision,
       state.newRevision,
@@ -442,7 +567,8 @@ export async function recoverReplacement(db) {
       );
     }
 
-    state.databaseFingerprint = databaseFingerprint(db);
+    state.databaseFingerprint =
+      databaseFingerprint(db);
 
     await manifest(state);
   }
@@ -483,15 +609,18 @@ export async function replaceDataset(
     );
   }
 
-  const local = openLocal(sourceId, {
-    existing: true,
-  });
+  const local = openLocal(
+    sourceId,
+    { existing: true },
+  );
 
   if (
     await local
       .collection('patterns')
       .countDocuments({
-        _alignment_issue: { $exists: true },
+        _alignment_issue: {
+          $exists: true,
+        },
       })
   ) {
     local.close();
@@ -507,7 +636,9 @@ export async function replaceDataset(
         .collection('patterns')
         .countDocuments())
     ) {
-      throw Error('The preview contains no pattern rows');
+      throw Error(
+        'The preview contains no pattern rows',
+      );
     }
 
     const state = {
@@ -521,23 +652,32 @@ export async function replaceDataset(
     try {
       if (failAfterClear) {
         await clearActiveCollections(db);
-        throw Error('Injected replacement failure');
+
+        throw Error(
+          'Injected replacement failure',
+        );
       }
 
-      const counts = await install(db, local, sourceId);
-
-      await db.collection('metadata').replaceOne(
-        { _id: 'active' },
-        {
-          _id: 'active',
-          ...metadata,
-          revision: sourceId,
-          total_rows: counts.patterns,
-          schemaVersion: 2,
-          updated_at: new Date(),
-        },
-        { upsert: true },
+      const counts = await install(
+        db,
+        local,
+        sourceId,
       );
+
+      await db
+        .collection('metadata')
+        .replaceOne(
+          { _id: 'active' },
+          {
+            _id: 'active',
+            ...metadata,
+            revision: sourceId,
+            total_rows: counts.patterns,
+            schemaVersion: 2,
+            updated_at: new Date(),
+          },
+          { upsert: true },
+        );
 
       await manifest({
         ...state,
@@ -546,14 +686,19 @@ export async function replaceDataset(
 
       await fs.unlink(maintenancePath);
 
-      // Keep one previous-dataset backup on local disk.
-      for (const name of await fs.readdir(storage)) {
+      // Retain one verified backup on local disk.
+      for (const name of await fs.readdir(
+        storage,
+      )) {
         if (
           /^backup-.*\.sqlite$/.test(name) &&
-          name !== state.backupId + '.sqlite'
+          name !==
+            state.backupId + '.sqlite'
         ) {
           await fs
-            .unlink(path.join(storage, name))
+            .unlink(
+              path.join(storage, name),
+            )
             .catch(() => {});
         }
       }
@@ -578,38 +723,51 @@ export async function replaceDataset(
   }
 }
 
-export async function activateDataset(db, job) {
-  const source = await db.collection('jobs').findOne({
-    _id: job.input.sourceJob,
-    owner: job.owner,
-    kind: 'import',
-    status: 'preview',
-  });
+export async function activateDataset(
+  db,
+  job,
+) {
+  const source = await db
+    .collection('jobs')
+    .findOne({
+      _id: job.input.sourceJob,
+      owner: job.owner,
+      kind: 'import',
+      status: 'preview',
+    });
 
   if (!source) {
-    throw Error('Import preview is unavailable');
+    throw Error(
+      'Import preview is unavailable',
+    );
   }
 
-  const counts = await replaceDataset(db, source._id, {
-    filename: source.result.filename,
-    file_date: source.result.fileDate,
-    updated_by: job.owner,
-  });
-
-  await db.collection('jobs').updateOne(
-    { _id: source._id },
+  const counts = await replaceDataset(
+    db,
+    source._id,
     {
-      $set: {
-        status: 'completed',
-        result: {
-          ...source.result,
-          replaced: true,
-          activePatterns: counts.patterns,
-          activeKeywords: counts.keywords,
-        },
-      },
+      filename: source.result.filename,
+      file_date: source.result.fileDate,
+      updated_by: job.owner,
     },
   );
+
+  await db
+    .collection('jobs')
+    .updateOne(
+      { _id: source._id },
+      {
+        $set: {
+          status: 'completed',
+          result: {
+            ...source.result,
+            replaced: true,
+            activePatterns: counts.patterns,
+            activeKeywords: counts.keywords,
+          },
+        },
+      },
+    );
 
   return {
     ...counts,
@@ -624,19 +782,30 @@ export async function optimizeStorage(db) {
     .collection('metadata')
     .findOne({ _id: 'active' });
 
-  const sourceId = 'optimize-' + randomUUID();
+  const sourceId =
+    'optimize-' + randomUUID();
 
   if (active) {
     await makeBackup(db, sourceId);
 
-    const counts = await replaceDataset(db, sourceId, {
-      filename: active.filename,
-      file_date: active.file_date,
-      updated_by: 'storage optimization',
-    });
+    const counts = await replaceDataset(
+      db,
+      sourceId,
+      {
+        filename: active.filename,
+        file_date: active.file_date,
+        updated_by:
+          'storage optimization',
+      },
+    );
 
     await fs
-      .unlink(path.join(storage, sourceId + '.sqlite'))
+      .unlink(
+        path.join(
+          storage,
+          sourceId + '.sqlite',
+        ),
+      )
       .catch(() => {});
 
     return {
@@ -645,8 +814,9 @@ export async function optimizeStorage(db) {
     };
   }
 
-  // Archive incomplete legacy imports before clearing them.
-  const archiveId = 'archive-' + randomUUID();
+  const archiveId =
+    'archive-' + randomUUID();
+
   const archive = openLocal(archiveId);
 
   let archived = 0;
