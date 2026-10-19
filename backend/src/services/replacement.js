@@ -8,7 +8,7 @@ import { expandedPairs } from './pairStore.js';
 import { auditPattern } from './performance.js';
 import { key, words } from './normalize.js';
 
-const BATCH_SIZE = 5000;
+const BATCH_SIZE = 10000;
 
 export const maintenancePath = path.join(
   storage,
