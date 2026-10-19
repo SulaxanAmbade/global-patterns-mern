@@ -235,15 +235,15 @@ export async function importDataset(db, job, progress) {
         });
 
         // Bound memory even for unusually large keyword cells.
-        if (pairs.length >= 1000) {
+        if (pairs.length >= 10000) {
           await flush();
         }
       }
     }
 
     if (
-      batch.length >= 500 ||
-      pairs.length >= 1000
+      batch.length >= 5000 ||
+      pairs.length >= 10000
     ) {
       await flush();
     }
@@ -309,7 +309,7 @@ export async function importDataset(db, job, progress) {
           revision: job._id,
         });
 
-        if (retained.length === 500) {
+        if (retained.length === 5000) {
           await db
             .collection('pairs')
             .insertMany(retained);
