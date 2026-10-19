@@ -15,12 +15,10 @@ export const maintenancePath = path.join(
   'replacement-state.json',
 );
 
-const digest = (value) =>
-  createHash('sha256')
-    .update(JSON.stringify(value))
-    .digest('hex');
+const digest = (v) =>
+  createHash('sha256').update(JSON.stringify(v)).digest('hex');
 
-// Keep database identity stable when SRV host order changes.
+// SRV resolution can change host order between connections.
 const databaseFingerprint = (db) => {
   const options = db.client.options;
 
@@ -34,18 +32,13 @@ const databaseFingerprint = (db) => {
 };
 
 function matchesDatabase(db, fingerprint) {
-  if (fingerprint === databaseFingerprint(db)) {
-    return true;
-  }
+  if (fingerprint === databaseFingerprint(db)) return true;
 
-  // Support manifests from the older fingerprint implementation.
+  // Accept manifests written by the earlier host-order-dependent version.
   const hosts = (db.client.options.hosts || []).map(String);
   const srv = db.client.options.srvHost || '';
 
-  if (
-    fingerprint ===
-    digest([db.databaseName, srv, hosts])
-  ) {
+  if (fingerprint === digest([db.databaseName, srv, hosts])) {
     return true;
   }
 
@@ -53,10 +46,11 @@ function matchesDatabase(db, fingerprint) {
 
   function visit(prefix, remaining) {
     if (!remaining.length) {
-      return (
-        fingerprint ===
-        digest([db.databaseName, srv, prefix])
-      );
+      return fingerprint === digest([
+        db.databaseName,
+        srv,
+        prefix,
+      ]);
     }
 
     return remaining.some((host, i) =>
@@ -70,14 +64,14 @@ function matchesDatabase(db, fingerprint) {
   return visit([], hosts);
 }
 
-const patternId = (row) =>
+const patternId = (r) =>
   digest([
-    row.url_pattern,
-    row.url_pattern_id,
-    row.priority,
-    row.language_code,
-    row.admin_name,
-    row.updated_admin_id,
+    r.url_pattern,
+    r.url_pattern_id,
+    r.priority,
+    r.language_code,
+    r.admin_name,
+    r.updated_admin_id,
   ]);
 
 export async function replacementState() {
@@ -85,9 +79,9 @@ export async function replacementState() {
     return JSON.parse(
       await fs.readFile(maintenancePath, 'utf8'),
     );
-  } catch (error) {
-    if (error.code === 'ENOENT') return null;
-    throw error;
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    throw e;
   }
 }
 
@@ -103,6 +97,8 @@ async function manifest(state) {
   );
 }
 
+// Retained for legacy recovery and explicit storage optimization.
+// Normal shared-dataset replacement does not call this function.
 export async function makeBackup(db, requestedId) {
   const metadata = await db
     .collection('metadata')
@@ -111,82 +107,61 @@ export async function makeBackup(db, requestedId) {
   const id = requestedId || 'backup-' + randomUUID();
   const local = openLocal(id);
 
-  let patternCount = 0;
-  let keywordCount = 0;
+  let pc = 0;
+  let kc = 0;
 
   const compact = metadata?.schemaVersion === 2;
 
-  console.log(
-    '[Dataset] Backing up the current dataset...',
-  );
+  console.log('[Dataset] Backing up the current dataset...');
 
   try {
     if (metadata) {
       let batch = [];
 
-      for await (const row of db
-        .collection('patterns')
-        .find({ revision: metadata.revision })
-        .batchSize(BATCH_SIZE)) {
+      for await (
+        const row of db
+          .collection('patterns')
+          .find({ revision: metadata.revision })
+          .batchSize(BATCH_SIZE)
+      ) {
         batch.push(row);
-        patternCount++;
+        pc++;
 
         if (batch.length >= BATCH_SIZE) {
-          await local
-            .collection('patterns')
-            .insertMany(batch);
-
+          await local.collection('patterns').insertMany(batch);
           batch = [];
         }
       }
 
       if (batch.length) {
-        await local
-          .collection('patterns')
-          .insertMany(batch);
+        await local.collection('patterns').insertMany(batch);
       }
 
       batch = [];
 
-      // Compact pairs need no join or repeated source metadata.
+      // Schema 2 pairs are already compact.
       const cursor = compact
-        ? db
-            .collection('pairs')
-            .find({})
-            .batchSize(BATCH_SIZE)
+        ? db.collection('pairs').find({}).batchSize(BATCH_SIZE)
         : expandedPairs(db, metadata);
 
       for await (const row of cursor) {
         batch.push(row);
-        keywordCount++;
+        kc++;
 
         if (batch.length >= BATCH_SIZE) {
-          await local
-            .collection('pairs')
-            .insertMany(batch);
-
+          await local.collection('pairs').insertMany(batch);
           batch = [];
         }
       }
 
       if (batch.length) {
-        await local
-          .collection('pairs')
-          .insertMany(batch);
+        await local.collection('pairs').insertMany(batch);
       }
     }
 
-    const savedPatterns = await local
-      .collection('patterns')
-      .countDocuments();
-
-    const savedKeywords = await local
-      .collection('pairs')
-      .countDocuments();
-
     if (
-      patternCount !== savedPatterns ||
-      keywordCount !== savedKeywords
+      pc !== await local.collection('patterns').countDocuments() ||
+      kc !== await local.collection('pairs').countDocuments()
     ) {
       throw Error('Backup count verification failed');
     }
@@ -195,87 +170,77 @@ export async function makeBackup(db, requestedId) {
   }
 
   console.log(
-    `[Dataset] Verified backup: ${patternCount} patterns, ${keywordCount} pairs.`,
+    `[Dataset] Verified backup: ${pc} patterns, ${kc} pairs.`,
   );
 
   return {
     databaseFingerprint: databaseFingerprint(db),
     backupId: id,
     backupMetadata: metadata,
-    backupPatterns: patternCount,
-    backupKeywords: keywordCount,
-    backupPairsFormat: compact
-      ? 'compact-v2'
-      : 'expanded',
+    backupPatterns: pc,
+    backupKeywords: kc,
+    backupPairsFormat: compact ? 'compact-v2' : 'expanded',
   };
 }
 
 async function clearActiveCollections(db) {
-  // Preserve sessions, jobs and metadata.
+  // Keep sessions, jobs and metadata.
   for (const name of ['patterns', 'pairs']) {
     await db.collection(name).deleteMany({});
 
     await db
       .collection(name)
       .dropIndexes()
-      .catch((error) => {
-        if (error.code !== 26) throw error;
+      .catch((e) => {
+        if (e.code !== 26) throw e;
       });
   }
 
-  // Remove obsolete MongoDB processing collections.
+  // Obsolete processing collections from earlier releases.
   for (const name of ['scratch', 'jobRows']) {
     await db
       .collection(name)
       .drop()
-      .catch((error) => {
-        if (error.code !== 26) throw error;
+      .catch((e) => {
+        if (e.code !== 26) throw e;
       });
   }
 }
 
 export async function compactIndexes(db) {
-  await db.collection('patterns').createIndex({
-    revision: 1,
-    length: -1,
-    _id: 1,
-  });
+  await db
+    .collection('patterns')
+    .createIndex({ revision: 1, length: -1, _id: 1 });
 
-  await db.collection('patterns').createIndex({
-    aliases: 1,
-    language_code: 1,
-  });
+  await db
+    .collection('patterns')
+    .createIndex({ aliases: 1, language_code: 1 });
 
-  await db.collection('pairs').createIndex({
-    patternId: 1,
-    keywordKey: 1,
-  });
+  await db
+    .collection('pairs')
+    .createIndex({ patternId: 1, keywordKey: 1 });
 }
 
-function compactPattern(row, revision) {
+function compactPattern(r, revision) {
   return {
-    _id: patternId(row),
-    url_pattern: row.url_pattern,
-    url_pattern_id: row.url_pattern_id,
-    priority: row.priority,
-    language_code: row.language_code,
-    admin_name: row.admin_name,
-    updated_admin_id: row.updated_admin_id,
-    domain: row.domain,
-    basis: row.basis,
-    normalized:
-      row.normalized ||
-      words(row.url_pattern).join(' '),
-    length:
-      row.length ||
-      row.url_pattern.length,
+    _id: patternId(r),
+    url_pattern: r.url_pattern,
+    url_pattern_id: r.url_pattern_id,
+    priority: r.priority,
+    language_code: r.language_code,
+    admin_name: r.admin_name,
+    updated_admin_id: r.updated_admin_id,
+    domain: r.domain,
+    basis: r.basis,
+    normalized: r.normalized || words(r.url_pattern).join(' '),
+    length: r.length || r.url_pattern.length,
     revision,
     aliases: [
       ...new Set(
         [
-          row.basis,
-          row.url_pattern,
-          row.domain + '*' + row.basis,
+          r.basis,
+          r.url_pattern,
+          r.domain + '*' + r.basis,
         ].map(auditPattern),
       ),
     ],
@@ -288,9 +253,7 @@ async function* compactPairs(local) {
 
   let cachedIds = 0;
 
-  for await (const pair of local
-    .collection('pairs')
-    .find()) {
+  for await (const pair of local.collection('pairs').find()) {
     const raw =
       pair.source_pattern === undefined &&
       pair.patternId !== undefined;
@@ -318,10 +281,7 @@ async function* compactPairs(local) {
             url_pattern: pair.source_pattern,
             language_code: pair.language,
             ...(pair.source_admin_name !== undefined
-              ? {
-                  admin_name:
-                    pair.source_admin_name,
-                }
+              ? { admin_name: pair.source_admin_name }
               : {}),
           };
 
@@ -334,13 +294,9 @@ async function* compactPairs(local) {
       if (ids.length <= 1000) {
         while (
           cache.size &&
-          (
-            cache.size >= 256 ||
-            cachedIds + ids.length > 5000
-          )
+          (cache.size >= 256 || cachedIds + ids.length > 5000)
         ) {
           const first = cache.keys().next().value;
-
           cachedIds -= cache.get(first).length;
           cache.delete(first);
         }
@@ -410,13 +366,10 @@ async function install(
 
       if (batch.length >= BATCH_SIZE) {
         await writeRemote(db, name, batch);
-
         count += batch.length;
         batch = [];
 
-        console.log(
-          `[Dataset] ${name}: ${count} processed`,
-        );
+        console.log(`[Dataset] ${name}: ${count} processed`);
       }
     }
 
@@ -426,138 +379,98 @@ async function install(
   }
 
   console.log('[Dataset] Building indexes...');
-
   await compactIndexes(db);
 
   return {
-    patterns: await db
-      .collection('patterns')
-      .countDocuments(),
-    keywords: await db
-      .collection('pairs')
-      .countDocuments(),
+    patterns: await db.collection('patterns').countDocuments(),
+    keywords: await db.collection('pairs').countDocuments(),
   };
 }
 
-// Compare disk-backed snapshots instead of keeping them in RAM.
-async function preparePlan(
-  source,
-  state,
-  revision,
-) {
-  const id = state.backupId + '-delta';
-  const target = openLocal(id);
-
-  try {
-    for (const name of ['patterns', 'pairs']) {
-      let batch = [];
-
-      const cursor =
-        name === 'patterns'
-          ? source.collection(name).find()
-          : compactPairs(source);
-
-      for await (const row of cursor) {
-        batch.push(
-          name === 'patterns'
-            ? compactPattern(row, revision)
-            : row,
-        );
-
-        if (batch.length >= BATCH_SIZE) {
-          await target
-            .collection(name)
-            .insertMany(batch);
-
-          batch = [];
-        }
-      }
-
-      if (batch.length) {
-        await target
-          .collection(name)
-          .insertMany(batch);
-      }
-    }
-  } finally {
-    target.close();
-  }
-
+// Keep only the incoming snapshot. Existing database rows are compared
+// in batches and are never saved as a rollback backup.
+async function preparePlan(source, remote, revision, compare) {
+  const id = 'replacement-' + randomUUID();
   const db = new DatabaseSync(localPath(id));
 
+  const changes = {};
+  const timings = {};
+  const started = performance.now();
+
   try {
-    db.exec(
-      'PRAGMA busy_timeout=10000; ' +
-      'PRAGMA cache_size=-8192; ' +
-      'PRAGMA temp_store=FILE;',
-    );
-
-    db.prepare(
-      'ATTACH DATABASE ? AS previous',
-    ).run(localPath(state.backupId));
-
     db.exec(`
-      CREATE TABLE delta (
-        kind TEXT NOT NULL,
-        id TEXT NOT NULL,
+      PRAGMA busy_timeout=10000;
+      PRAGMA cache_size=-8192;
+      PRAGMA temp_store=FILE;
+
+      CREATE TABLE patterns(
+        id TEXT PRIMARY KEY,
+        payload TEXT NOT NULL
+      );
+
+      CREATE TABLE pairs(
+        id TEXT PRIMARY KEY,
+        payload TEXT NOT NULL
+      );
+
+      CREATE TABLE mapping(
+        sourceId TEXT,
+        url TEXT,
+        language TEXT,
+        admin TEXT,
+        pid TEXT
+      );
+
+      CREATE TABLE seen(
+        kind TEXT,
+        id TEXT,
+        PRIMARY KEY(kind,id)
+      );
+
+      CREATE TABLE delta(
+        kind TEXT,
+        id TEXT,
         payload TEXT,
         PRIMARY KEY(kind,id)
       );
-      BEGIN;
     `);
 
+    const putPattern = db.prepare(`
+      INSERT INTO patterns VALUES(?,?)
+      ON CONFLICT(id) DO UPDATE SET payload=excluded.payload
+    `);
+
+    const putMapping = db.prepare(`
+      INSERT INTO mapping VALUES(?,?,?,?,?)
+    `);
+
+    let pending = 0;
+
+    db.exec('BEGIN');
+
     try {
-      for (const name of ['patterns', 'pairs']) {
-        const fields =
-          name === 'patterns'
-            ? [
-                'url_pattern',
-                'url_pattern_id',
-                'priority',
-                'language_code',
-                'admin_name',
-                'updated_admin_id',
-                'domain',
-                'basis',
-                'normalized',
-                'length',
-                'aliases',
-              ]
-            : [
-                'patternId',
-                'keyword',
-                'keywordKey',
-              ];
+      for await (
+        const row of source.collection('patterns').find()
+      ) {
+        const compact = compactPattern(row, revision);
 
-        const differs = fields
-          .map(
-            (field) =>
-              `json_extract(t.payload,'$.${field}') ` +
-              `IS NOT json_extract(p.payload,'$.${field}')`,
-          )
-          .join(' OR ');
+        putPattern.run(
+          compact._id,
+          JSON.stringify(compact),
+        );
 
-        db.exec(`
-          INSERT INTO delta
-          SELECT
-            '${name}-upsert',
-            t.id,
-            t.payload
-          FROM main.${name} t
-          LEFT JOIN previous.${name} p
-            ON t.id=p.id
-          WHERE p.id IS NULL OR ${differs};
+        putMapping.run(
+          String(row._id),
+          row.url_pattern ?? null,
+          row.language_code ?? null,
+          row.admin_name ?? null,
+          compact._id,
+        );
 
-          INSERT INTO delta
-          SELECT
-            '${name}-delete',
-            p.id,
-            NULL
-          FROM previous.${name} p
-          LEFT JOIN main.${name} t
-            ON p.id=t.id
-          WHERE t.id IS NULL;
-        `);
+        if (++pending >= BATCH_SIZE) {
+          db.exec('COMMIT; BEGIN');
+          pending = 0;
+        }
       }
 
       db.exec('COMMIT');
@@ -566,57 +479,302 @@ async function preparePlan(
       throw error;
     }
 
-    db.exec('DETACH DATABASE previous');
+    db.exec(`
+      CREATE INDEX mapping_source
+      ON mapping(url,language,admin);
 
-    const changes = {};
+      CREATE INDEX mapping_id
+      ON mapping(sourceId);
+    `);
+
+    const byId = db.prepare(`
+      SELECT pid FROM mapping WHERE sourceId=?
+    `);
+
+    const bySource = db.prepare(`
+      SELECT pid FROM mapping
+      WHERE url IS ? AND language IS ?
+    `);
+
+    const byAdmin = db.prepare(`
+      SELECT pid FROM mapping
+      WHERE url IS ? AND language IS ? AND admin IS ?
+    `);
+
+    const putPair = db.prepare(`
+      INSERT INTO pairs VALUES(?,?)
+      ON CONFLICT(id) DO UPDATE SET payload=excluded.payload
+    `);
+
+    // Cache only compact IDs. Pattern hashes are computed once above.
+    const cache = new Map();
+    let cachedIds = 0;
+
+    pending = 0;
+    db.exec('BEGIN');
+
+    try {
+      for await (
+        const pair of source.collection('pairs').find()
+      ) {
+        const raw =
+          pair.source_pattern === undefined &&
+          pair.patternId !== undefined;
+
+        const cacheKey = JSON.stringify(
+          raw
+            ? ['id', pair.patternId]
+            : [
+                'source',
+                pair.source_pattern,
+                pair.language,
+                pair.source_admin_name !== undefined,
+                pair.source_admin_name,
+              ],
+        );
+
+        let ids = cache.get(cacheKey);
+
+        if (!ids) {
+          const matches = raw
+            ? byId.all(String(pair.patternId))
+            : pair.source_admin_name !== undefined
+              ? byAdmin.all(
+                  pair.source_pattern ?? null,
+                  pair.language ?? null,
+                  pair.source_admin_name ?? null,
+                )
+              : bySource.all(
+                  pair.source_pattern ?? null,
+                  pair.language ?? null,
+                );
+
+          ids = matches.map((row) => row.pid);
+
+          if (ids.length <= 1000) {
+            while (
+              cache.size &&
+              (
+                cache.size >= 256 ||
+                cachedIds + ids.length > 5000
+              )
+            ) {
+              const first = cache.keys().next().value;
+              cachedIds -= cache.get(first).length;
+              cache.delete(first);
+            }
+
+            cache.set(cacheKey, ids);
+            cachedIds += ids.length;
+          }
+        }
+
+        const keywordKey = key(pair.keyword);
+
+        for (const pid of ids) {
+          const row = {
+            _id: digest([pid, keywordKey]),
+            patternId: pid,
+            keyword: pair.keyword,
+            keywordKey,
+          };
+
+          putPair.run(
+            row._id,
+            JSON.stringify(row),
+          );
+
+          if (++pending >= BATCH_SIZE) {
+            db.exec('COMMIT; BEGIN');
+            pending = 0;
+          }
+        }
+      }
+
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+
+    db.exec('DROP TABLE mapping');
+
+    timings.prepareMs = Math.round(
+      performance.now() - started,
+    );
+
+    const comparing = performance.now();
+
+    if (compare) {
+      for (const name of ['patterns', 'pairs']) {
+        const fields = name === 'patterns'
+          ? [
+              'url_pattern',
+              'url_pattern_id',
+              'priority',
+              'language_code',
+              'admin_name',
+              'updated_admin_id',
+              'domain',
+              'basis',
+              'normalized',
+              'length',
+              'aliases',
+            ]
+          : [
+              'patternId',
+              'keyword',
+              'keywordKey',
+            ];
+
+        const get = db.prepare(`
+          SELECT payload FROM ${name} WHERE id=?
+        `);
+
+        const seen = db.prepare(`
+          INSERT OR IGNORE INTO seen VALUES(?,?)
+        `);
+
+        const delta = db.prepare(`
+          INSERT OR REPLACE INTO delta VALUES(?,?,?)
+        `);
+
+        const projection = Object.fromEntries(
+          ['_id', ...fields].map((field) => [field, 1]),
+        );
+
+        const cursor = remote
+          .collection(name)
+          .find({}, { projection })
+          .batchSize(BATCH_SIZE);
+
+        let batch = [];
+        let scanned = 0;
+
+        const flush = () => {
+          db.exec('BEGIN');
+
+          try {
+            for (const old of batch) {
+              const current = get.get(String(old._id));
+
+              if (!current) {
+                delta.run(
+                  name + '-delete',
+                  String(old._id),
+                  null,
+                );
+              } else {
+                seen.run(name, String(old._id));
+
+                const row = JSON.parse(current.payload);
+
+                const differs = fields.some(
+                  (field) =>
+                    JSON.stringify(row[field] ?? null) !==
+                    JSON.stringify(old[field] ?? null),
+                );
+
+                if (differs) {
+                  delta.run(
+                    name + '-upsert',
+                    String(old._id),
+                    current.payload,
+                  );
+                }
+              }
+            }
+
+            db.exec('COMMIT');
+          } catch (error) {
+            db.exec('ROLLBACK');
+            throw error;
+          }
+
+          scanned += batch.length;
+          batch = [];
+        };
+
+        for await (const row of cursor) {
+          batch.push(row);
+
+          if (batch.length >= BATCH_SIZE) {
+            flush();
+          }
+        }
+
+        if (batch.length) {
+          flush();
+        }
+
+        db.prepare(`
+          INSERT INTO delta
+          SELECT ?,t.id,t.payload
+          FROM ${name} t
+          LEFT JOIN seen s
+            ON s.kind=? AND s.id=t.id
+          WHERE s.id IS NULL
+        `).run(name + '-upsert', name);
+
+        console.log(
+          `[Dataset] Compared ${scanned} existing ${name}; no rollback backup created.`,
+        );
+      }
+    }
 
     for (const name of ['patterns', 'pairs']) {
-      for (const operation of [
-        'upsert',
-        'delete',
-      ]) {
-        const kind = name + '-' + operation;
-
-        changes[kind] = db.prepare(
-          'SELECT count(*) AS n FROM delta WHERE kind=?',
-        ).get(kind).n;
+      for (const operation of ['upsert', 'delete']) {
+        changes[name + '-' + operation] = db
+          .prepare(`
+            SELECT count(*) AS n
+            FROM delta
+            WHERE kind=?
+          `)
+          .get(name + '-' + operation).n;
       }
     }
 
     const counts = {
-      patterns: db.prepare(
-        'SELECT count(*) AS n FROM patterns',
-      ).get().n,
-      keywords: db.prepare(
-        'SELECT count(*) AS n FROM pairs',
-      ).get().n,
+      patterns: db
+        .prepare('SELECT count(*) AS n FROM patterns')
+        .get().n,
+      keywords: db
+        .prepare('SELECT count(*) AS n FROM pairs')
+        .get().n,
     };
+
+    timings.compareMs = Math.round(
+      performance.now() - comparing,
+    );
+
+    db.exec('DROP TABLE seen');
 
     return {
       id,
       db,
       changes,
       counts,
+      timings,
     };
   } catch (error) {
     db.close();
+
+    await fs.unlink(localPath(id)).catch(() => {});
+
     throw error;
   }
 }
 
-async function applyPlan(
-  db,
-  plan,
-  state,
-  revision,
-) {
-  // Release space occupied by removed records first.
+async function applyPlan(db, plan, state, revision) {
+  // Delete obsolete records first to release storage quota.
   for (const name of ['pairs', 'patterns']) {
     let ids = [];
 
-    const cursor = plan.db.prepare(
-      'SELECT id FROM delta WHERE kind=? ORDER BY id',
-    ).iterate(name + '-delete');
+    const cursor = plan.db.prepare(`
+      SELECT id FROM delta
+      WHERE kind=?
+      ORDER BY id
+    `).iterate(name + '-delete');
 
     for (const row of cursor) {
       ids.push(row.id);
@@ -641,16 +799,17 @@ async function applyPlan(
     let batch = [];
     let count = 0;
 
-    const cursor = plan.db.prepare(
-      'SELECT payload FROM delta WHERE kind=? ORDER BY id',
-    ).iterate(name + '-upsert');
+    const cursor = plan.db.prepare(`
+      SELECT payload FROM delta
+      WHERE kind=?
+      ORDER BY id
+    `).iterate(name + '-upsert');
 
     for (const row of cursor) {
       batch.push(JSON.parse(row.payload));
 
       if (batch.length >= BATCH_SIZE) {
         await writeRemote(db, name, batch);
-
         count += batch.length;
         batch = [];
 
@@ -666,40 +825,30 @@ async function applyPlan(
     }
 
     console.log(
-      `[Dataset] ${name}: ${count} added/changed; ` +
-      `${plan.changes[name + '-delete']} removed.`,
+      `[Dataset] ${name}: ${count} added/changed; ${
+        plan.changes[name + '-delete']
+      } removed.`,
     );
   }
 
-  // Promote retained patterns without re-sending their data.
+  // Update retained patterns to the new active revision.
   await db.collection('patterns').updateMany(
-    {
-      revision: state.backupMetadata.revision,
-    },
-    {
-      $set: { revision },
-    },
+    { revision: state.backupMetadata.revision },
+    { $set: { revision } },
   );
 
   const counts = {
-    patterns: await db
-      .collection('patterns')
-      .countDocuments(),
-    keywords: await db
-      .collection('pairs')
-      .countDocuments(),
+    patterns: await db.collection('patterns').countDocuments(),
+    keywords: await db.collection('pairs').countDocuments(),
   };
 
   if (
     counts.patterns !== plan.counts.patterns ||
     counts.keywords !== plan.counts.keywords
   ) {
-    throw Error(
-      'Replacement count verification failed',
-    );
+    throw Error('Replacement count verification failed');
   }
 
-  // Preserve the existing indexes.
   return counts;
 }
 
@@ -724,12 +873,7 @@ async function cleanupBackups(keep) {
 }
 
 async function restore(db, state) {
-  if (
-    !matchesDatabase(
-      db,
-      state.databaseFingerprint,
-    )
-  ) {
+  if (!matchesDatabase(db, state.databaseFingerprint)) {
     throw Error(
       'Recovery backup belongs to a different database. Restore the previous MONGODB_URI before recovering.',
     );
@@ -746,8 +890,7 @@ async function restore(db, state) {
       local,
       state.backupMetadata?.revision || 'empty',
       {
-        rawBackup:
-          state.backupPairsFormat === 'compact-v2',
+        rawBackup: state.backupPairsFormat === 'compact-v2',
       },
     );
 
@@ -761,9 +904,9 @@ async function restore(db, state) {
         { upsert: true },
       );
     } else {
-      await db
-        .collection('metadata')
-        .deleteOne({ _id: 'active' });
+      await db.collection('metadata').deleteOne({
+        _id: 'active',
+      });
     }
 
     await fs.unlink(maintenancePath);
@@ -778,21 +921,142 @@ async function restore(db, state) {
   }
 }
 
+// An interrupted no-backup update resumes the NEW snapshot.
+// It cannot restore the previous dataset.
+async function finishReplacement(db, plan, state) {
+  let counts;
+
+  if (state.mode === 'incremental') {
+    counts = await applyPlan(
+      db,
+      plan,
+      state,
+      state.newRevision,
+    );
+  } else {
+    const target = openLocal(
+      state.deltaId,
+      { existing: true },
+    );
+
+    try {
+      counts = await install(
+        db,
+        target,
+        state.newRevision,
+        { rawBackup: true },
+      );
+    } finally {
+      target.close();
+    }
+
+    if (
+      counts.patterns !== state.counts.patterns ||
+      counts.keywords !== state.counts.keywords
+    ) {
+      throw Error('Replacement count verification failed');
+    }
+  }
+
+  await db.collection('metadata').replaceOne(
+    { _id: 'active' },
+    {
+      _id: 'active',
+      ...state.metadata,
+      revision: state.newRevision,
+      total_rows: counts.patterns,
+      schemaVersion: 2,
+      updated_at: new Date(),
+    },
+    { upsert: true },
+  );
+
+  await manifest({
+    ...state,
+    phase: 'committed',
+  });
+
+  await fs.unlink(maintenancePath);
+
+  return counts;
+}
+
 export async function recoverReplacement(db) {
   const state = await replacementState();
 
   if (!state) return;
 
+  if (state.noRollback) {
+    if (!matchesDatabase(db, state.databaseFingerprint)) {
+      throw Error(
+        'Interrupted update belongs to another database. Restore the original MONGODB_URI.',
+      );
+    }
+
+    const active = await db
+      .collection('metadata')
+      .findOne({ _id: 'active' });
+
+    if (
+      state.phase === 'committed' &&
+      active?.revision === state.newRevision
+    ) {
+      await fs.unlink(maintenancePath);
+
+      await fs
+        .unlink(localPath(state.deltaId))
+        .catch(() => {});
+
+      return;
+    }
+
+    try {
+      await fs.access(localPath(state.deltaId));
+    } catch {
+      throw Error(
+        'The interrupted update has no rollback backup and its incoming snapshot is missing. Keep shared-data access blocked; restore the incoming snapshot before retrying.',
+      );
+    }
+
+    const local = new DatabaseSync(
+      localPath(state.deltaId),
+    );
+
+    try {
+      console.log(
+        '[Recovery] Resuming the new dataset; no previous-data backup exists.',
+      );
+
+      await finishReplacement(
+        db,
+        {
+          db: local,
+          counts: state.counts,
+          changes: state.changes,
+        },
+        state,
+      );
+    } finally {
+      local.close();
+    }
+
+    await fs
+      .unlink(localPath(state.deltaId))
+      .catch(() => {});
+
+    console.log(
+      '[Recovery] New dataset update completed.',
+    );
+
+    return;
+  }
+
+  // Compatibility with interrupted updates from older versions.
   const active = await db
     .collection('metadata')
     .findOne({ _id: 'active' });
 
-  if (
-    !matchesDatabase(
-      db,
-      state.databaseFingerprint,
-    )
-  ) {
+  if (!matchesDatabase(db, state.databaseFingerprint)) {
     const expected = [
       state.backupMetadata?.revision,
       state.newRevision,
@@ -807,9 +1071,7 @@ export async function recoverReplacement(db) {
       );
     }
 
-    state.databaseFingerprint =
-      databaseFingerprint(db);
-
+    state.databaseFingerprint = databaseFingerprint(db);
     await manifest(state);
   }
 
@@ -843,14 +1105,11 @@ export async function recoverReplacement(db) {
   );
 }
 
-export async function replaceDataset(
+// Used only by explicit storage optimization.
+async function replaceWithBackup(
   db,
   sourceId,
   metadata,
-  {
-    failAfterClear = false,
-    forceFull = false,
-  } = {},
 ) {
   if (await replacementState()) {
     throw Error(
@@ -863,7 +1122,6 @@ export async function replaceDataset(
     { existing: true },
   );
 
-  let plan;
   let backup;
 
   const started = performance.now();
@@ -871,11 +1129,9 @@ export async function replaceDataset(
 
   try {
     if (
-      await source
-        .collection('patterns')
-        .countDocuments({
-          _alignment_issue: { $exists: true },
-        })
+      await source.collection('patterns').countDocuments({
+        _alignment_issue: { $exists: true },
+      })
     ) {
       throw Error(
         'Unresolved workbook alignment errors remain. Correct the flagged language rows and re-upload before replacing shared data.',
@@ -883,13 +1139,9 @@ export async function replaceDataset(
     }
 
     if (
-      !(await source
-        .collection('patterns')
-        .countDocuments())
+      !await source.collection('patterns').countDocuments()
     ) {
-      throw Error(
-        'The preview contains no pattern rows',
-      );
+      throw Error('The preview contains no pattern rows');
     }
 
     backup = await makeBackup(db);
@@ -904,77 +1156,18 @@ export async function replaceDataset(
       phase: 'replacing',
     };
 
-    let canUpdate =
-      !forceFull &&
-      backup.backupPairsFormat === 'compact-v2';
-
-    if (canUpdate) {
-      const [
-        patterns,
-        scratch,
-        jobRows,
-      ] = await Promise.all([
-        db.collection('patterns').countDocuments(),
-        db.collection('scratch').countDocuments(),
-        db.collection('jobRows').countDocuments(),
-      ]);
-
-      canUpdate =
-        patterns === backup.backupPatterns &&
-        scratch === 0 &&
-        jobRows === 0;
-    }
-
-    const planningStarted = performance.now();
-
-    if (canUpdate) {
-      console.log(
-        '[Dataset] Comparing the new dataset with the backup...',
-      );
-
-      plan = await preparePlan(
-        source,
-        state,
-        sourceId,
-      );
-
-      state.deltaId = plan.id;
-
-      console.log(
-        '[Dataset] Planned changes:',
-        JSON.stringify(plan.changes),
-      );
-    }
-
-    timings.planMs = Math.round(
-      performance.now() - planningStarted,
-    );
+    timings.planMs = 0;
 
     await manifest(state);
 
     try {
-      if (failAfterClear) {
-        await clearActiveCollections(db);
-
-        throw Error(
-          'Injected replacement failure',
-        );
-      }
-
       const writingStarted = performance.now();
 
-      const counts = plan
-        ? await applyPlan(
-            db,
-            plan,
-            state,
-            sourceId,
-          )
-        : await install(
-            db,
-            source,
-            sourceId,
-          );
+      const counts = await install(
+        db,
+        source,
+        sourceId,
+      );
 
       timings.writeMs = Math.round(
         performance.now() - writingStarted,
@@ -1013,8 +1206,8 @@ export async function replaceDataset(
 
       return {
         ...counts,
-        mode: plan ? 'incremental' : 'full',
-        changes: plan?.changes || null,
+        mode: 'full',
+        changes: null,
         timings,
       };
     } catch (error) {
@@ -1033,33 +1226,184 @@ export async function replaceDataset(
     }
   } finally {
     source.close();
+  }
+}
 
-    if (plan) plan.db.close();
+export async function replaceDataset(
+  db,
+  sourceId,
+  metadata,
+  {
+    failAfterClear = false,
+    forceFull = false,
+  } = {},
+) {
+  if (await replacementState()) {
+    throw Error(
+      'An interrupted update must finish first. Restart the backend to resume it.',
+    );
+  }
 
-    if (backup) {
-      await fs
-        .unlink(
-          localPath(backup.backupId + '-delta'),
-        )
-        .catch(() => {});
+  const source = openLocal(
+    sourceId,
+    { existing: true },
+  );
+
+  const started = performance.now();
+
+  let plan;
+  let marked = false;
+  let completed = false;
+
+  try {
+    if (
+      await source.collection('patterns').countDocuments({
+        _alignment_issue: { $exists: true },
+      })
+    ) {
+      throw Error(
+        'Unresolved workbook alignment errors remain. Correct the flagged language rows and re-upload before replacing shared data.',
+      );
+    }
+
+    if (
+      !await source.collection('patterns').countDocuments()
+    ) {
+      throw Error('The preview contains no pattern rows');
+    }
+
+    const active = await db
+      .collection('metadata')
+      .findOne({ _id: 'active' });
+
+    let incremental =
+      !forceFull && active?.schemaVersion === 2;
+
+    if (incremental) {
+      const [all, current, scratch, jobRows] =
+        await Promise.all([
+          db.collection('patterns').countDocuments(),
+          db.collection('patterns').countDocuments({
+            revision: active.revision,
+          }),
+          db.collection('scratch').countDocuments(),
+          db.collection('jobRows').countDocuments(),
+        ]);
+
+      incremental =
+        all === current &&
+        scratch === 0 &&
+        jobRows === 0;
+    }
+
+    console.log(
+      '[Dataset] Preparing replacement without a rollback backup...',
+    );
+
+    const planningStarted = performance.now();
+
+    plan = await preparePlan(
+      source,
+      db,
+      sourceId,
+      incremental,
+    );
+
+    const timings = {
+      backupMs: 0,
+      ...plan.timings,
+      planMs: Math.round(
+        performance.now() - planningStarted,
+      ),
+    };
+
+    const state = {
+      noRollback: true,
+      databaseFingerprint: databaseFingerprint(db),
+      backupMetadata: active,
+      newRevision: sourceId,
+      deltaId: plan.id,
+      phase: 'replacing',
+      mode: incremental ? 'incremental' : 'full',
+      metadata,
+      counts: plan.counts,
+      changes: plan.changes,
+    };
+
+    console.log(
+      '[Dataset] Planned changes:',
+      JSON.stringify(plan.changes),
+    );
+
+    await manifest(state);
+    marked = true;
+
+    try {
+      if (failAfterClear) {
+        await clearActiveCollections(db);
+        throw Error('Injected replacement failure');
+      }
+
+      const writingStarted = performance.now();
+
+      const counts = await finishReplacement(
+        db,
+        plan,
+        state,
+      );
+
+      completed = true;
+
+      timings.writeMs = Math.round(
+        performance.now() - writingStarted,
+      );
+
+      timings.totalMs = Math.round(
+        performance.now() - started,
+      );
+
+      console.log(
+        '[Dataset] Replacement complete:',
+        JSON.stringify(timings),
+      );
+
+      return {
+        ...counts,
+        mode: state.mode,
+        changes: incremental ? plan.changes : null,
+        timings,
+        rollbackBackup: false,
+      };
+    } catch (error) {
+      throw Error(
+        `Replacement paused (${error.message}). There is no rollback backup. Keep backend/storage intact and restart to resume the new dataset.`,
+      );
+    }
+  } finally {
+    source.close();
+
+    if (plan) {
+      plan.db.close();
+
+      if (!marked || completed) {
+        await fs
+          .unlink(localPath(plan.id))
+          .catch(() => {});
+      }
     }
   }
 }
 
 export async function activateDataset(db, job) {
-  const source = await db
-    .collection('jobs')
-    .findOne({
-      _id: job.input.sourceJob,
-      owner: job.owner,
-      kind: 'import',
-      status: 'preview',
-    });
+  const source = await db.collection('jobs').findOne({
+    _id: job.input.sourceJob,
+    owner: job.owner,
+    kind: 'import',
+    status: 'preview',
+  });
 
   if (!source) {
-    throw Error(
-      'Import preview is unavailable',
-    );
+    throw Error('Import preview is unavailable');
   }
 
   const counts = await replaceDataset(
@@ -1100,13 +1444,12 @@ export async function optimizeStorage(db) {
     .collection('metadata')
     .findOne({ _id: 'active' });
 
-  const sourceId =
-    'optimize-' + randomUUID();
+  const sourceId = 'optimize-' + randomUUID();
 
   if (active) {
     await makeBackup(db, sourceId);
 
-    const counts = await replaceDataset(
+    const counts = await replaceWithBackup(
       db,
       sourceId,
       {
@@ -1114,16 +1457,10 @@ export async function optimizeStorage(db) {
         file_date: active.file_date,
         updated_by: 'storage optimization',
       },
-      { forceFull: true },
     );
 
     await fs
-      .unlink(
-        path.join(
-          storage,
-          sourceId + '.sqlite',
-        ),
-      )
+      .unlink(path.join(storage, sourceId + '.sqlite'))
       .catch(() => {});
 
     return {
@@ -1132,10 +1469,10 @@ export async function optimizeStorage(db) {
     };
   }
 
-  const archiveId =
-    'archive-' + randomUUID();
-
+  // Archive incomplete legacy imports before explicit cleanup.
+  const archiveId = 'archive-' + randomUUID();
   const archive = openLocal(archiveId);
+
   let archived = 0;
 
   try {
@@ -1147,26 +1484,20 @@ export async function optimizeStorage(db) {
     ]) {
       let batch = [];
 
-      for await (const row of db
-        .collection(name)
-        .find()
-        .batchSize(500)) {
+      for await (
+        const row of db.collection(name).find().batchSize(500)
+      ) {
         batch.push(row);
         archived++;
 
         if (batch.length === 500) {
-          await archive
-            .collection(name)
-            .insertMany(batch);
-
+          await archive.collection(name).insertMany(batch);
           batch = [];
         }
       }
 
       if (batch.length) {
-        await archive
-          .collection(name)
-          .insertMany(batch);
+        await archive.collection(name).insertMany(batch);
       }
     }
   } finally {
