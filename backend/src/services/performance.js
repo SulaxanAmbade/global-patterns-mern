@@ -1,4 +1,3 @@
-import { liveMappings } from './pairStore.js';
 import { csvRows } from './files.js';
 import { key, text, number, totalRow, splitPattern } from './normalize.js';
 import { createHash } from 'node:crypto';
@@ -115,8 +114,8 @@ export async function performance(db, job, progress) {
     const basis = text(row[cols.basis]),
       keyword = text(row[cols.keyword]);
     if (!basis || !keyword) throw Error('Every row needs a basis and keyword');
-    const lang = key(row[cols.language]),
-      domain = key(row[cols.domain]);
+    const lang = (text(row[cols.language]) || text(job.input.defaultLanguage)).toUpperCase(),
+      domain = (text(row[cols.domain]) || text(job.input.defaultDomain));
     const values = {};
     for (const m of used) {
       values[m] = number(row[cols[m]], m);
@@ -177,16 +176,7 @@ export async function performance(db, job, progress) {
     .collection('scratch')
     .find({ jobId: job._id, impressions: { $gte: c.minimum } })
     .batchSize(200)) {
-    const matches = await liveMappings(
-      db.remote || db,
-      job.input.revision,
-      row.bkey,
-      row.keywordKey,
-      row.language,
-      row.domain,
-    );
-    if (!matches.length) continue;
-    const set = { eligible: true, matches };
+    const set = { eligible: true };
     for (const m of used) {
       if (m === 'impressions') continue;
       if (['revenue', 'clicks', 'ad_clicks'].includes(m)) set[m] = row[m];
@@ -236,7 +226,6 @@ export async function performance(db, job, progress) {
         language: row.language,
         domain: row.domain,
         'Basis Average RPM': average.rpm,
-        matches: row.matches,
       };
       for (const m of used) out[m] = row[m];
       batch.push(out);
@@ -249,5 +238,6 @@ export async function performance(db, job, progress) {
   }
   if (batch.length) await db.collection('jobRows').insertMany(batch);
   await db.collection('scratch').deleteMany({ jobId: job._id });
-  return { rows: seq, eligible, removed, sourceRows: count };
+  return { rows: seq, eligible, removed, sourceRows: count, source: 'uploaded-csv', sharedDatasetRequired: false };
 }
+

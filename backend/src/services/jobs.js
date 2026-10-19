@@ -59,14 +59,14 @@ export async function startQueue(db) {
   }
   let nextAttemptAt = 0;
   const tick = async () => {
-    if (busy || Date.now() < nextAttemptAt || (await replacementState()))
-      return;
+    if (busy || Date.now() < nextAttemptAt) return;
+    const recovering = !!(await replacementState());
     busy = true;
     try {
       const job = await db
         .collection('jobs')
         .findOneAndUpdate(
-          { status: 'queued' },
+          { status: 'queued', ...(recovering ? { kind: 'performance' } : {}) },
           { $set: { status: 'running', startedAt: new Date() } },
           { sort: { createdAt: 1 }, returnDocument: 'after' },
         );

@@ -109,14 +109,10 @@ export default function PerformancePage() {
     [job, setJob] = useState(null),
     [selected, setSelected] = useState(new Set()),
     [replacements, setReplacements] = useState([]),
-    [domains, setDomains] = useState([]),
+    [defaultDomain, setDefaultDomain] = useState(''),
+    [defaultLanguage, setDefaultLanguage] = useState(''),
     [error, setError] = useState(''),
     [busy, setBusy] = useState(false);
-  useEffect(() => {
-    api('/dataset/meta')
-      .then((m) => setDomains(m.domains))
-      .catch((e) => setError(e.message));
-  }, []);
   useEffect(() => {
     let cancelled = false;
     setHeaders([]);
@@ -156,8 +152,8 @@ export default function PerformancePage() {
       <div className="eyebrow">KEYWORD AUDIT</div>
       <h1>Keyword Performance Check</h1>
       <p>
-        Review existing database pairs using your conditions. Select pairs for a
-        deletion sheet, then enter replacements manually.
+        Review the keywords in your uploaded CSV using your conditions. Select rows
+        for a deletion sheet, then enter replacements manually.
       </p>
       {error && <p className="error">{error}</p>}
       <section className="card">
@@ -196,6 +192,11 @@ export default function PerformancePage() {
             {duplicates && headerFile === file && <p className="error">Each CSV column can only be mapped once.</p>}
           </div>
         )}
+        <div className="row">
+          <label>Default Domain (Optional)<input value={defaultDomain} onChange={(e) => setDefaultDomain(e.target.value)} /></label>
+          <label>Default Language (Optional)<input value={defaultLanguage} onChange={(e) => setDefaultLanguage(e.target.value.toUpperCase())} /></label>
+        </div>
+        <p>Defaults fill blank or unmapped domain and language values. Deletion exports need both. Performance analysis does not require them.</p>
         <h2>Performance Check Conditions</h2>
         <div className="row">
           <label>
@@ -283,6 +284,7 @@ export default function PerformancePage() {
               action(async () => {
                 if (!mappingReady) throw Error('Complete the required column selections first.');
                 const j = await submitFile('/jobs/performance', file, {
+                  defaultDomain, defaultLanguage,
                   columns,
                   minimum,
                   mode,
@@ -354,8 +356,8 @@ export default function PerformancePage() {
             <>
               <h2>Manual Replacement Keywords</h2>
               <p>
-                Fill and select the rows to include. Keywords already present
-                for the same basis and language are rejected.
+                Fill and select the rows to include. Duplicate rows within this upload sheet are rejected. Existing shared keywords
+                are not checked.
               </p>
               {replacements.map((r, i) => (
                 <div className="replacement" key={i}>
@@ -382,35 +384,12 @@ export default function PerformancePage() {
                   ].map((k) => (
                     <label key={k}>
                       {k}
-                      {k === 'domain' ? (
-                        <select
-                          value={k === 'languagecode' ? String(r[k] ?? '').toUpperCase() : r[k]}
-                          onChange={(e) =>
-                            setReplacements(
-                              replacements.map((x, j) =>
-                                j === i ? { ...x, [k]: e.target.value } : x,
-                              ),
-                            )
-                          }
-                        >
-                          {[...new Set([r.domain, ...domains])].map((d) => (
-                            <option key={d}>{d}</option>
-                          ))}
-                        </select>
-                      ) : (
-                        <input
-                          value={k === 'languagecode' ? String(r[k] ?? '').toUpperCase() : r[k]}
-                          type={k === 'priority' ? 'number' : 'text'}
-                          min={k === 'priority' ? 0 : undefined}
-                          onChange={(e) =>
-                            setReplacements(
-                              replacements.map((x, j) =>
-                                j === i ? { ...x, [k]: e.target.value } : x,
-                              ),
-                            )
-                          }
-                        />
-                      )}
+                      <input
+                        value={k === 'languagecode' ? String(r[k] ?? '').toUpperCase() : r[k]}
+                        type={k === 'priority' ? 'number' : 'text'}
+                        min={k === 'priority' ? 0 : undefined}
+                        onChange={(e) => setReplacements(replacements.map((x, j) => j === i ? { ...x, [k]: e.target.value } : x))}
+                      />
                     </label>
                   ))}
                 </div>
@@ -437,3 +416,4 @@ export default function PerformancePage() {
     </>
   );
 }
+

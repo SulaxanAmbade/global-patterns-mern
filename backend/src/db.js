@@ -14,8 +14,8 @@ export async function init(db) {
     .collection('sessions')
     .createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
   const m = await db.collection('metadata').findOne({ _id: 'active' });
-  if (m?.schemaVersion === 2) {
+  if (m?.schemaVersion >= 2) {
     const { compactIndexes } = await import('./services/replacement.js');
-    await compactIndexes(db);
+    await compactIndexes(db, { patternsOnly: true });
   }
 }

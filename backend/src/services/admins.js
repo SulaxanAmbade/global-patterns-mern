@@ -40,7 +40,7 @@ export function baseAdmin(value) {
     .trim();
 }
 // Store only distinct admin identities; pattern/keyword rows remain in MongoDB.
-export async function repairAdmins(db, revision, historicalDb = db) {
+export async function repairAdmins(db, revision, historicalDb = db, { repairPairs = true } = {}) {
   const current = await historicalDb
     .collection('metadata')
     .findOne({ _id: 'active' });
@@ -88,7 +88,7 @@ export async function repairAdmins(db, revision, historicalDb = db) {
     moved += result.modifiedCount;
     if (!r.id) recovered += result.modifiedCount;
     else if (adminId(r.id) !== id) overwritten += result.modifiedCount;
-    await db
+    if (repairPairs) await db
       .collection('pairs')
       .updateMany(
         { revision, source_admin_id: r.id, source_admin_name: r.name },
@@ -131,7 +131,7 @@ export async function repairAdmins(db, revision, historicalDb = db) {
     filled += result.modifiedCount;
     if (saved) databaseFilled += result.modifiedCount;
     else workbookFilled += result.modifiedCount;
-    await db
+    if (repairPairs) await db
       .collection('pairs')
       .updateMany(
         { revision, source_admin_id: id, source_admin_name: '' },
@@ -156,3 +156,4 @@ export async function repairAdmins(db, revision, historicalDb = db) {
     ].sort(),
   };
 }
+

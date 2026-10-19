@@ -1,7 +1,6 @@
 import { validLanguage, languageCode } from '../services/alignment.js';
 import { coverageReportRoutes } from '../services/coverageReports.js';
 import { openLocal } from '../services/localStore.js';
-import { liveMappings } from '../services/pairStore.js';
 import { Router } from 'express';
 import { enqueue } from '../services/jobs.js';
 import { active } from './dataset.js';
@@ -23,8 +22,8 @@ export function jobRoutes(upload) {
       throw Error('Invalid job type');
     const options = JSON.parse(req.body.options || '{}'),
       db = req.app.locals.db,
-      m = await active(db);
-    if (!req.file && options.sourceJob) {
+      m = req.params.kind === 'coverage' ? await active(db) : null;
+    if (req.params.kind === 'coverage' && !req.file && options.sourceJob) {
       const src = await db.collection('jobs').findOne({
         _id: options.sourceJob,
         owner: req.user,
@@ -47,7 +46,7 @@ export function jobRoutes(upload) {
           db,
           req.user,
           req.params.kind,
-          { ...options, revision: m.revision },
+          { ...options, ...(m ? { revision: m.revision } : { revision: undefined }) },
           req.file,
         ),
       );
@@ -131,14 +130,6 @@ async function selectedMappings(req) {
     ids.some((n) => !Number.isSafeInteger(n) || n < 0)
   )
     throw Error('Select 1–10000 pairs');
-  const current = await req.app.locals.db
-    .collection('metadata')
-    .findOne({ _id: 'active' });
-  if (current?.revision !== job.input.revision)
-    throw Object.assign(
-      Error('The shared dataset changed. Run the performance check again.'),
-      { status: 409 },
-    );
   const local = openLocal(job._id, { existing: true });
   let rows;
   try {
@@ -150,19 +141,17 @@ async function selectedMappings(req) {
     local.close();
   }
   const unique = new Map();
-  for (const row of rows)
-    for (const m of row.matches) {
-      if (m.issue)
-        throw Error(
-          `${m.basis}: ${m.issue}. Correct admin_name setid and re-import.`,
-        );
-      unique.set(
-        JSON.stringify([m.domain, m.basis, m.keywords, m.languagecode]),
-        m,
-      );
-    }
+  if (rows.length !== new Set(ids).size) throw Error('Some selected rows are unavailable');
+  for (const row of rows) {
+    const m = {
+      domain: text(row.domain), basis: text(row.basis),
+      keywords: text(row.keyword), languagecode: text(row.language).toUpperCase(),
+    };
+    unique.set(JSON.stringify([m.domain, m.basis, key(m.keywords), m.languagecode]), m);
+  }
   return [...unique.values()];
 }
+
 async function writeRows(res, rows, columns, name) {
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="${name}"`);
@@ -172,14 +161,12 @@ async function writeRows(res, rows, columns, name) {
       await once(res, 'drain');
   res.end();
 }
-jobs.post('/:id/deletion', async (req, res) =>
-  writeRows(
-    res,
-    await selectedMappings(req),
-    ['domain', 'basis', 'keywords', 'languagecode'],
-    'keyword_deletion.csv',
-  ),
-);
+jobs.post('/:id/deletion', async (req, res) => {
+  const rows = await selectedMappings(req);
+  if (rows.some(row => !row.domain || !validLanguage(row.languagecode)))
+    throw Error('Deletion export needs a domain and valid language for each selected row. Map those CSV columns or set defaults and run the check again.');
+  await writeRows(res, rows, ['domain', 'basis', 'keywords', 'languagecode'], 'keyword_deletion.csv');
+});
 jobs.post('/:id/replacements', async (req, res) => {
   const mappings = await selectedMappings(req);
   res.json(
@@ -200,28 +187,12 @@ jobs.post('/:id/replacements', async (req, res) => {
   );
 });
 jobs.post('/:id/upload-sheet', async (req, res) => {
-  const j = await owned(req),
-    db = req.app.locals.db,
-    rows = req.body.rows;
+  const j = await owned(req), rows = req.body.rows;
   if (j.kind !== 'performance' || j.status !== 'completed')
     throw Error('Invalid performance job');
   if (!Array.isArray(rows) || !rows.length || rows.length > 10000)
     throw Error('Select 1–10000 replacement rows');
-  if (
-    (await db.collection('metadata').findOne({ _id: 'active' }))?.revision !==
-    j.input.revision
-  )
-    throw Object.assign(
-      Error('The shared dataset changed. Run the performance check again.'),
-      { status: 409 },
-    );
-  const domains = new Set(
-      await db
-        .collection('patterns')
-        .distinct('domain', { revision: j.input.revision }),
-    ),
-    seen = new Set(),
-    output = [];
+  const seen = new Set(), output = [];
   for (const r of rows) {
     const domain = text(r.domain),
       basis = text(r.basis),
@@ -236,14 +207,7 @@ jobs.post('/:id/upload-sheet', async (req, res) => {
       throw Error(
         'Every replacement needs a basis, keyword and valid language code',
       );
-    if (
-      !domains.has(domain) &&
-      !(
-        /^patternkeywords\.global\.promote\.\d+\.setid$/.test(domain) &&
-        [...domains].some((d) => d.startsWith('patternkeywords.global.promote'))
-      )
-    )
-      throw Error('Choose an available domain');
+    if (!domain || /[\s*]/.test(domain)) throw Error('Enter a domain without spaces or wildcards');
     if (
       domain.startsWith('patternkeywords.global.') &&
       !domain.includes('.promote') &&
@@ -253,25 +217,12 @@ jobs.post('/:id/upload-sheet', async (req, res) => {
     if (!Number.isSafeInteger(p))
       throw Error('Priority must be a nonnegative whole number');
     const identity = JSON.stringify([
+      key(domain),
       auditPattern(basis),
       languagecode,
       key(keywords),
     ]);
-    if (
-      seen.has(identity) ||
-      (
-        await liveMappings(
-          db,
-          j.input.revision,
-          basis,
-          key(keywords),
-          languagecode,
-        )
-      ).length > 0
-    )
-      throw Error(
-        'Keyword already exists under this basis/language or repeats a replacement',
-      );
+    if (seen.has(identity)) throw Error('A keyword repeats for the same domain, basis and language in this upload sheet');
     seen.add(identity);
     output.push({
       domain,
@@ -289,4 +240,3 @@ jobs.post('/:id/upload-sheet', async (req, res) => {
     'keyword_upload.csv',
   );
 });
-
