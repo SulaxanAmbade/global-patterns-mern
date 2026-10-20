@@ -1,4 +1,7 @@
-import { repairWorkbookRow } from './alignment.js';
+import {
+  repairWorkbookRow,
+  headerName,
+} from './alignment.js';
 import { datasetRows } from './files.js';
 import {
   splitPattern,
@@ -13,6 +16,17 @@ import {
 } from './admins.js';
 import { createHash } from 'node:crypto';
 
+const patternFields = new Set([
+  'url_pattern',
+  'url_pattern_id',
+  'priority',
+  'language_code',
+  'admin_name',
+  'updated_admin_id',
+  'total_count',
+  'url_pattern_order',
+]);
+
 export async function importDataset(db, job, progress) {
   const startedAt = performance.now();
   const timings = {};
@@ -22,6 +36,34 @@ export async function importDataset(db, job, progress) {
   let stageWriteMs = 0;
   let progressMs = 0;
   let flushes = 0;
+  let stagedRows = 0;
+  let duplicatesSkipped = 0;
+  let cacheHits = 0;
+
+  // Keep memory bounded. SQLite still handles duplicates that fall
+  // outside these cache limits.
+  const seenIds = new Set();
+  const recent = new Map();
+  let recentCharacters = 0;
+
+  const remember = (signature, summary) => {
+    if (signature.length > 4096) return;
+
+    while (
+      recent.size &&
+      (
+        recent.size >= 4096 ||
+        recentCharacters + signature.length > 2 * 1024 * 1024
+      )
+    ) {
+      const oldest = recent.keys().next().value;
+      recentCharacters -= oldest.length;
+      recent.delete(oldest);
+    }
+
+    recent.set(signature, summary);
+    recentCharacters += signature.length;
+  };
 
   const local = db.local || (db.filename ? db : null);
 
@@ -56,6 +98,46 @@ export async function importDataset(db, job, progress) {
     blockingRows: 0,
     missingLanguageRows: 0,
     examples: [],
+  };
+
+  // Count repairs and alignment issues for every source row,
+  // including rows whose pattern was already staged.
+  const recordDiagnostics = (summary) => {
+    count++;
+    repairs += summary.fixes.length;
+
+    if (
+      summary.fixes.includes('pattern_id_from_total_count')
+    ) {
+      alignment.patternIdsRecovered++;
+    }
+
+    if (
+      summary.fixes.some(
+        (fix) =>
+          fix === 'language_from_url_pattern_order' ||
+          fix === 'language_from_url_pattern',
+      )
+    ) {
+      alignment.languagesRecovered++;
+    }
+
+    if (summary.missingLanguage) {
+      alignment.missingLanguageRows++;
+    }
+
+    if (summary.issue) {
+      alignment.blockingRows++;
+
+      if (alignment.examples.length < 20) {
+        alignment.examples.push({
+          dataRow: sourceRow,
+          url_pattern: summary.urlPattern,
+          originalLanguage: summary.originalLanguage,
+          issue: summary.issue,
+        });
+      }
+    }
   };
 
   const flush = async () => {
@@ -103,57 +185,43 @@ export async function importDataset(db, job, progress) {
       try {
         sourceRow++;
 
-        // Keyword pairs are no longer imported or stored.
-        const {
-          pattern_keywords: ignoredKeywords,
-          ...patternRow
-        } = rawRow;
+        // Ignore keyword columns and other fields that do not
+        // affect the shared pattern record or alignment repairs.
+        const patternRow = Object.fromEntries(
+          Object.entries(rawRow).filter(([name]) =>
+            patternFields.has(headerName(name)),
+          ),
+        );
+
+        const signature = JSON.stringify(patternRow);
+        const cached = recent.get(signature);
+
+        if (cached) {
+          recent.delete(signature);
+          recent.set(signature, cached);
+
+          recordDiagnostics(cached);
+          cacheHits++;
+          duplicatesSkipped++;
+          continue;
+        }
 
         const repaired = repairWorkbookRow(patternRow);
         const row = repaired.row;
 
         if (!text(row.url_pattern)) continue;
 
-        repairs += repaired.fixes.length;
+        const summary = {
+          fixes: repaired.fixes,
+          missingLanguage: repaired.missingLanguage,
+          issue: repaired.issue,
+          originalLanguage: repaired.originalLanguage,
+          urlPattern: row.url_pattern,
+        };
 
-        if (
-          repaired.fixes.includes(
-            'pattern_id_from_total_count',
-          )
-        ) {
-          alignment.patternIdsRecovered++;
-        }
+        recordDiagnostics(summary);
 
-        if (
-          repaired.fixes.some(
-            (fix) =>
-              fix === 'language_from_url_pattern_order' ||
-              fix === 'language_from_url_pattern',
-          )
-        ) {
-          alignment.languagesRecovered++;
-        }
-
-        if (repaired.missingLanguage) {
-          alignment.missingLanguageRows++;
-        }
-
-        if (repaired.issue) {
-          alignment.blockingRows++;
-
-          if (alignment.examples.length < 20) {
-            alignment.examples.push({
-              dataRow: sourceRow,
-              url_pattern: row.url_pattern,
-              originalLanguage: repaired.originalLanguage,
-              issue: repaired.issue,
-            });
-          }
-        }
-
-        const [domain, basis] = splitPattern(
-          row.url_pattern,
-        );
+        const [domain, basis] = splitPattern(row.url_pattern);
 
         const r = {
           url_pattern: text(row.url_pattern),
@@ -177,7 +245,20 @@ export async function importDataset(db, job, progress) {
           .update(JSON.stringify(r))
           .digest('hex');
 
-        count++;
+        remember(signature, summary);
+
+        // Different raw spellings may produce the same repaired
+        // pattern. Avoid staging that pattern again.
+        if (seenIds.has(identity)) {
+          duplicatesSkipped++;
+          continue;
+        }
+
+        if (seenIds.size < 100000) {
+          seenIds.add(identity);
+        }
+
+        stagedRows++;
 
         batch.push({
           updateOne: {
@@ -239,7 +320,9 @@ export async function importDataset(db, job, progress) {
     JSON.stringify({
       ...timings,
       sourceRows: sourceRow,
-      stagedRows: count,
+      stagedRows,
+      duplicatesSkipped,
+      cacheHits,
       flushes,
     }),
   );
@@ -296,6 +379,10 @@ export async function importDataset(db, job, progress) {
     adminRepairs,
     skippedKeywordRows: 0,
     keywordPairsStored: false,
+    sourceRows: sourceRow,
+    stagedRows,
+    duplicatesSkipped,
+    cacheHits,
     repairs: repairs + (adminRepairs.repairedRows || 0),
     alignment,
     filename: job.upload.originalname,
