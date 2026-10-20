@@ -2,7 +2,10 @@ import {
   repairWorkbookRow,
   headerName,
 } from './alignment.js';
-import { datasetRows } from './files.js';
+import {
+  datasetRowBatches,
+  datasetPatternFields,
+} from './files.js';
 import {
   splitPattern,
   text,
@@ -15,17 +18,6 @@ import {
   repairAdmins,
 } from './admins.js';
 import { createHash } from 'node:crypto';
-
-const patternFields = new Set([
-  'url_pattern',
-  'url_pattern_id',
-  'priority',
-  'language_code',
-  'admin_name',
-  'updated_admin_id',
-  'total_count',
-  'url_pattern_order',
-]);
 
 export async function importDataset(db, job, progress) {
   const startedAt = performance.now();
@@ -40,8 +32,10 @@ export async function importDataset(db, job, progress) {
   let duplicatesSkipped = 0;
   let cacheHits = 0;
 
-  // Keep memory bounded. SQLite still handles duplicates that fall
-  // outside these cache limits.
+  let previousHeaders;
+  let selectedHeaders = [];
+  let headerSignature = '';
+
   const seenIds = new Set();
   const recent = new Map();
   let recentCharacters = 0;
@@ -100,8 +94,6 @@ export async function importDataset(db, job, progress) {
     examples: [],
   };
 
-  // Count repairs and alignment issues for every source row,
-  // including rows whose pattern was already staged.
   const recordDiagnostics = (summary) => {
     count++;
     repairs += summary.fixes.length;
@@ -161,7 +153,7 @@ export async function importDataset(db, job, progress) {
     }
   };
 
-  const iterator = datasetRows(
+  const iterator = datasetRowBatches(
     job.upload.path,
     job.upload.originalname,
   )[Symbol.asyncIterator]();
@@ -179,104 +171,131 @@ export async function importDataset(db, job, progress) {
 
       if (next.done) break;
 
-      const rawRow = next.value;
-      const transformStarted = performance.now();
+      for (const rawRow of next.value) {
+        const transformStarted = performance.now();
 
-      try {
-        sourceRow++;
+        try {
+          sourceRow++;
 
-        // Ignore keyword columns and other fields that do not
-        // affect the shared pattern record or alignment repairs.
-        const patternRow = Object.fromEntries(
-          Object.entries(rawRow).filter(([name]) =>
-            patternFields.has(headerName(name)),
-          ),
-        );
+          const headers = Object.keys(rawRow);
 
-        const signature = JSON.stringify(patternRow);
-        const cached = recent.get(signature);
+          if (
+            !previousHeaders ||
+            headers.length !== previousHeaders.length ||
+            headers.some(
+              (name, index) =>
+                name !== previousHeaders[index],
+            )
+          ) {
+            previousHeaders = headers;
 
-        if (cached) {
-          recent.delete(signature);
-          recent.set(signature, cached);
+            selectedHeaders = headers.filter((name) =>
+              datasetPatternFields.has(headerName(name)),
+            );
 
-          recordDiagnostics(cached);
-          cacheHits++;
-          duplicatesSkipped++;
-          continue;
-        }
+            headerSignature = JSON.stringify(
+              selectedHeaders,
+            );
+          }
 
-        const repaired = repairWorkbookRow(patternRow);
-        const row = repaired.row;
+          const signature =
+            headerSignature +
+            JSON.stringify(
+              selectedHeaders.map((name) => rawRow[name]),
+            );
 
-        if (!text(row.url_pattern)) continue;
+          const cached = recent.get(signature);
 
-        const summary = {
-          fixes: repaired.fixes,
-          missingLanguage: repaired.missingLanguage,
-          issue: repaired.issue,
-          originalLanguage: repaired.originalLanguage,
-          urlPattern: row.url_pattern,
-        };
+          if (cached) {
+            recent.delete(signature);
+            recent.set(signature, cached);
 
-        recordDiagnostics(summary);
+            recordDiagnostics(cached);
+            cacheHits++;
+            duplicatesSkipped++;
+            continue;
+          }
 
-        const [domain, basis] = splitPattern(row.url_pattern);
+          const patternRow = Object.fromEntries(
+            selectedHeaders.map((name) => [
+              name,
+              rawRow[name],
+            ]),
+          );
 
-        const r = {
-          url_pattern: text(row.url_pattern),
-          url_pattern_id: text(row.url_pattern_id),
-          priority: text(row.priority),
-          language_code: row.language_code,
-          admin_name: cleanAdmin(row.admin_name),
-          updated_admin_id: adminId(row.updated_admin_id),
-          domain,
-          basis,
-          basisKey: basisKey(basis),
-          normalized: words(row.url_pattern).join(' '),
-          length: text(row.url_pattern).length,
-          revision: job._id,
-          ...(repaired.issue
-            ? { _alignment_issue: repaired.issue }
-            : {}),
-        };
+          const repaired = repairWorkbookRow(patternRow);
+          const row = repaired.row;
 
-        const identity = createHash('sha256')
-          .update(JSON.stringify(r))
-          .digest('hex');
+          if (!text(row.url_pattern)) continue;
 
-        remember(signature, summary);
+          const summary = {
+            fixes: repaired.fixes,
+            missingLanguage: repaired.missingLanguage,
+            issue: repaired.issue,
+            originalLanguage: repaired.originalLanguage,
+            urlPattern: row.url_pattern,
+          };
 
-        // Different raw spellings may produce the same repaired
-        // pattern. Avoid staging that pattern again.
-        if (seenIds.has(identity)) {
-          duplicatesSkipped++;
-          continue;
-        }
+          recordDiagnostics(summary);
 
-        if (seenIds.size < 100000) {
-          seenIds.add(identity);
-        }
+          const [domain, basis] = splitPattern(
+            row.url_pattern,
+          );
 
-        stagedRows++;
+          const r = {
+            url_pattern: text(row.url_pattern),
+            url_pattern_id: text(row.url_pattern_id),
+            priority: text(row.priority),
+            language_code: row.language_code,
+            admin_name: cleanAdmin(row.admin_name),
+            updated_admin_id: adminId(row.updated_admin_id),
+            domain,
+            basis,
+            basisKey: basisKey(basis),
+            normalized: words(row.url_pattern).join(' '),
+            length: text(row.url_pattern).length,
+            revision: job._id,
+            ...(repaired.issue
+              ? { _alignment_issue: repaired.issue }
+              : {}),
+          };
 
-        batch.push({
-          updateOne: {
-            filter: {
-              _id: job._id + identity,
+          const identity = createHash('sha256')
+            .update(JSON.stringify(r))
+            .digest('hex');
+
+          remember(signature, summary);
+
+          if (seenIds.has(identity)) {
+            duplicatesSkipped++;
+            continue;
+          }
+
+          if (seenIds.size < 100000) {
+            seenIds.add(identity);
+          }
+
+          stagedRows++;
+
+          batch.push({
+            updateOne: {
+              filter: {
+                _id: job._id + identity,
+              },
+              update: {
+                $set: r,
+              },
+              upsert: true,
             },
-            update: {
-              $set: r,
-            },
-            upsert: true,
-          },
-        });
-      } finally {
-        transformMs += performance.now() - transformStarted;
-      }
+          });
+        } finally {
+          transformMs +=
+            performance.now() - transformStarted;
+        }
 
-      if (batch.length >= 5000) {
-        await flush();
+        if (batch.length >= 5000) {
+          await flush();
+        }
       }
     }
   } finally {
